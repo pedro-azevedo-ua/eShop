@@ -2,58 +2,80 @@
 using eShop.Basket.API.Repositories;
 using eShop.Basket.API.Extensions;
 using eShop.Basket.API.Model;
+using eShop.WebApp;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 
 namespace eShop.Basket.API.Grpc;
 
 public class BasketService(
     IBasketRepository repository,
-    ILogger<BasketService> logger) : Basket.BasketBase
+    ILogger<BasketService> logger,
+    Instrumentation instrumentation
+    ) : Basket.BasketBase
+
 {
+
+    private ActivitySource activitySource = instrumentation.ActivitySource;
+
+    private string MaskId(string id)
+    {
+        return string.IsNullOrEmpty(id) ? id : $"{id[..^20]}********************";
+    }
+
     [AllowAnonymous]
     public override async Task<CustomerBasketResponse> GetBasket(GetBasketRequest request, ServerCallContext context)
     {
-        var userId = context.GetUserIdentity();
-        if (string.IsNullOrEmpty(userId))
+
+        using (var myActivity = activitySource.StartActivity("[BasketAPI] GetBasket"))
         {
+            var userId = context.GetUserIdentity();
+           
+            if (string.IsNullOrEmpty(userId))
+            {
+                return new();
+            }
+            if (logger.IsEnabled(LogLevel.Debug))
+            {
+                logger.LogDebug("Begin GetBasketById call from method {Method} for basket id {Id}", context.Method, MaskId(userId));
+            }
+            myActivity?.SetTag("[BasketAPI] userId", MaskId(userId));
+            var data = await repository.GetBasketAsync(userId);
+            if (data is not null)
+            {
+                myActivity?.SetTag("[BasketAPI] basketItems", data.Items.Count);
+                return MapToCustomerBasketResponse(data);
+            }
             return new();
         }
-
-        if (logger.IsEnabled(LogLevel.Debug))
-        {
-            logger.LogDebug("Begin GetBasketById call from method {Method} for basket id {Id}", context.Method, userId);
-        }
-
-        var data = await repository.GetBasketAsync(userId);
-
-        if (data is not null)
-        {
-            return MapToCustomerBasketResponse(data);
-        }
-
-        return new();
     }
 
     public override async Task<CustomerBasketResponse> UpdateBasket(UpdateBasketRequest request, ServerCallContext context)
     {
-        var userId = context.GetUserIdentity();
-        if (string.IsNullOrEmpty(userId))
+        using (var myActivity = activitySource.StartActivity("[BasketAPI] UpdateBasket"))
         {
-            ThrowNotAuthenticated();
-        }
+            var userId = context.GetUserIdentity();
+            if (string.IsNullOrEmpty(userId))
+            {
+                ThrowNotAuthenticated();
+            }
 
-        if (logger.IsEnabled(LogLevel.Debug))
-        {
-            logger.LogDebug("Begin UpdateBasket call from method {Method} for basket id {Id}", context.Method, userId);
-        }
+            if (logger.IsEnabled(LogLevel.Debug))
+            {
+                logger.LogDebug("Begin UpdateBasket call from method {Method} for basket id {Id}", context.Method, MaskId(userId));
+            }
+            myActivity?.SetTag("[BasketAPI]  userId", MaskId(userId));
 
-        var customerBasket = MapToCustomerBasket(userId, request);
-        var response = await repository.UpdateBasketAsync(customerBasket);
-        if (response is null)
-        {
-            ThrowBasketDoesNotExist(userId);
-        }
+            var customerBasket = MapToCustomerBasket(userId, request);
+            var response = await repository.UpdateBasketAsync(customerBasket);
+            if (response is null)
+            {
+                myActivity?.SetTag("[BasketAPI] updated", response);
+                ThrowBasketDoesNotExist(userId);
+            }
 
-        return MapToCustomerBasketResponse(response);
+            return MapToCustomerBasketResponse(response);
+        }
     }
 
     public override async Task<DeleteBasketResponse> DeleteBasket(DeleteBasketRequest request, ServerCallContext context)

@@ -3,17 +3,40 @@ using Microsoft.AspNetCore.Components;
 using Microsoft.AspNetCore.Components.Authorization;
 using eShop.WebAppComponents.Catalog;
 using eShop.WebAppComponents.Services;
+using System.Diagnostics;
+using eShop.WebApp;
+using System.Diagnostics.Metrics;
 
-namespace eShop.WebApp.Services;
+using NLog;
+
+
 
 public class BasketState(
     BasketService basketService,
     CatalogService catalogService,
     OrderingService orderingService,
-    AuthenticationStateProvider authenticationStateProvider) : IBasketState
+    AuthenticationStateProvider authenticationStateProvider,
+    Instrumentation instrumentation
+    ) : IBasketState
 {
+    
     private Task<IReadOnlyCollection<BasketItem>>? _cachedBasket;
     private HashSet<BasketStateChangedSubscription> _changeSubscriptions = new();
+    
+    private ActivitySource activitySource = instrumentation.ActivitySource;
+
+    private static readonly Meter basketMeter = new Meter("eShop.WebApp.Basket");
+    private static readonly Counter<int> _basketAddCounter = basketMeter.CreateCounter<int>(
+     name: "basket_items_total",  
+     unit: "{items}",            
+     description: "Total number of items added to basket"
+ );
+
+    private static readonly Histogram<double> _basketOperationDuration = basketMeter.CreateHistogram<double>(
+        name: "basket_operation_duration_seconds", 
+        unit: "s",                                
+        description: "Duration of basket operations"
+    );
 
     public Task DeleteBasketAsync()
         => basketService.DeleteBasketAsync();
@@ -29,30 +52,101 @@ public class BasketState(
         _changeSubscriptions.Add(subscription);
         return subscription;
     }
+    private static readonly Logger Logger = LogManager.GetCurrentClassLogger();
+    private string MaskUser(string user)
+    {
+
+        return (string.IsNullOrEmpty(user) || user.Length <= 2) ? user: $"{user[0]}***{user[^1]}";
+    }
+
+    private string MaskId(string id)
+    {
+        return string.IsNullOrEmpty(id) ? id : $"{id[..^20]}********************";
+    }
+
 
     public async Task AddAsync(CatalogItem item)
     {
-        var items = (await FetchBasketItemsAsync()).Select(i => new BasketQuantity(i.ProductId, i.Quantity)).ToList();
-        bool found = false;
-        for (var i = 0; i < items.Count; i++)
+        var user = await authenticationStateProvider.GetUserNameAsync();
+        var userId = await authenticationStateProvider.GetBuyerIdAsync();
+
+        var start_time = DateTime.UtcNow;
+        if (user == null || userId == null)
         {
-            var existing = items[i];
-            if (existing.ProductId == item.Id)
+            throw new InvalidOperationException("User is not logged");
+        }
+        Logger.Info("User {User} with ID {UserId} is adding item to basket: {ProductId}", MaskUser(user), MaskId(userId), item.Id);
+
+        _basketAddCounter.Add(1, new KeyValuePair<string, object?>("event", "start"));
+        Logger.Info("Adding item to basket: {ProductId}", item.Id);
+
+        using (var myActivity = activitySource.StartActivity("Add_item"))
+        {
+            try
             {
-                items[i] = existing with { Quantity = existing.Quantity + 1 };
-                found = true;
-                break;
+                myActivity?.SetTag("product.id", item.Id);
+
+                myActivity?.SetTag("operation.fetch.start", "Starting to fetch basket items");
+                var items = (await FetchBasketItemsAsync()).Select(i => new BasketQuantity(i.ProductId, i.Quantity)).ToList();
+                myActivity?.SetTag("operation.fetch.complete", "Basket items retrieved");
+                myActivity?.SetTag("basket.items.count", items.Count);
+
+                bool found = false;
+                for (var i = 0; i < items.Count; i++)
+                {
+                    var existing = items[i];
+                    if (existing.ProductId == item.Id)
+                    {
+                        items[i] = existing with { Quantity = existing.Quantity + 1 };
+                        found = true;
+                        myActivity?.SetTag("operation.type", "update_quantity");
+                        myActivity?.SetTag("item.quantity.new", existing.Quantity + 1);
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    _basketAddCounter.Add(1, new KeyValuePair<string, object?>("event", "new_item"));
+                    items.Add(new BasketQuantity(item.Id, 1));
+                    myActivity?.SetTag("operation.type", "add_new_item");
+                }
+
+                myActivity?.SetTag("operation.update.start", "Starting basket update");
+                _cachedBasket = null;
+                await basketService.UpdateBasketAsync(items);
+                myActivity?.SetTag("operation.update.complete", "Basket updated");
+
+                myActivity?.SetTag("operation.notify.start", "Starting notifications");
+                await NotifyChangeSubscribersAsync();
+                myActivity?.SetTag("operation.notify.complete", "Notifications sent");
+
+                _basketAddCounter.Add(1, new KeyValuePair<string, object?>[] {
+                    new("operation", "add"),
+                    new("product_id", item.Id.ToString())
+                });
+
+                _basketOperationDuration.Record(
+                    (DateTime.UtcNow - start_time).TotalSeconds,
+                    new KeyValuePair<string, object?>[] {
+                    new("operation", "add_item")
+                    }
+                );
+
+                myActivity?.SetTag("operation.status", "success");
             }
-        }
+            catch (Exception exe)
+            {
+                _basketAddCounter.Add(1, new KeyValuePair<string, object?>[] {
+                new("operation_status", "error"),
+                new("error_type", exe.GetType().Name)
+            });
+                myActivity?.SetTag("operation.status", "error");
+                myActivity?.SetTag("error.message", exe.Message);
+                throw;
+            }
 
-        if (!found)
-        {
-            items.Add(new BasketQuantity(item.Id, 1));
         }
-
-        _cachedBasket = null;
-        await basketService.UpdateBasketAsync(items);
-        await NotifyChangeSubscribersAsync();
     }
 
     public async Task SetQuantityAsync(int productId, int quantity)
